@@ -91,10 +91,6 @@ The server-side race window still exists (two `/lazy` requests in rapid successi
 
 **HMR patches deliberately omit the dedup flag** (`dedup_module_initializer: false`): a patch's whole point is to re-execute the module body and publish new exports, so deduping would silently drop updates. Code comments mark the flag as a workaround pending a runtime dispose/re-execute API.
 
-### Link-Stage-Synthesized Exports (JSON, text, base64, dataurl)
-
-Modules whose exports are synthesized at link time are **broken inside lazy chunks** (and HMR patches): JSON/text/base64/dataurl modules are scanned as a bare expression statement with `ExportsKind::None`, and the `export default` is materialized only by the link stage's `generate_lazy_export` — which the lazy/HMR render path never runs (it renders pristine scan-time AST clones). The lazy chunk registers them as `registerModule(id, {})`, so importers see **empty exports on first lazy load**; after the background rebuild + a page refresh the full build applies the transform and the same import works. No playground fixture covers this yet.
-
 ### CSS
 
 CSS bundling was removed from rolldown (#4271), and the lazy boundary is created without loading the target — so `import('./style.css')` builds fine and the hard error (`Bundling CSS is no longer supported`) is **deferred to the first `/lazy` request**: HTTP 500, catchable rejection at the consumer's `await import()`.
@@ -463,6 +459,22 @@ The flow is:
 **Problem**: The dev runtime registry only holds modules this build wrapped, so an external is never in it — `loadExports('<external id>')` warns `Module <id> not found` and returns `{}`. The plain-import arm of the HMR finalizer knew this and emitted a real `import * as X from 'ext'` hoisted outside the wrapper; the three re-export arms (`export * from`, `export * as ns from`, `export { x } from`) did not, and asked the registry instead. Every re-exported name read as `undefined`, silently. When the same module also imported that external, both arms named the binding through `ensure_static_import_info` but deduplicated against different sets, so both declarations were emitted under one name — and since the real import sits at chunk top level while the `var` sits inside the factory, the `var` legally shadowed it and the module's own uses of the external broke too.
 
 **Solution**: Route all four arms through one `create_importee_binding_stmt`, which picks `loadExports` for normal modules and a real import statement for externals. The per-kind deduplication sets then stay disjoint by construction, so the shadowing `var` cannot be emitted. Pinned by `crates/rolldown/tests/rolldown/topics/hmr/reexport_external/` (HMR patch, executed) and a `dev-lazy-compile.test.ts` case (lazy chunk).
+
+### Issue 13: `ExportsKind::None` Does Not Mean "No Exports"
+
+The scanner sees one module at a time, so it writes `ExportsKind::None` for anything whose exports it cannot settle alone — a file with no module syntax, and every lazy-export module (JSON, text, base64, dataurl; `meta::has_lazy_export`). It means "no importer has spoken yet". The link stage then settles it: `determine_module_exports_kind` promotes from the importers, and `generate_lazy_export` materializes the export syntax a lazy-export module stands for. This render path runs neither — it renders pristine scan-time AST clones — and taking the scanned field at face value broke both halves.
+
+**Problem A — the module registered no exports at all.** A scanned-`None` module emitted `registerModule(id, {})`, whose second argument is the `exportsHolder`. `{}` has no `exports` property, so `loadExports` returned `undefined` rather than an empty namespace, and any importer dereferencing it threw `TypeError`. The eager output for the same module registers `{ exports: … }`, because by then it had been promoted. Reachable two ways: `import * as ns from './side-effect.js'` on a file with no module syntax, and — worse, since the payload was also dropped on the floor as a discarded expression statement — any import of a `.json` file, which broke every consumer of it until a full page reload.
+
+**Problem B — a lazy-export module lowered to the shape its importers did not ask for.** `require('./x.json')` must see the payload itself; an `import` must see a namespace carrying `default`. Only the importers say which.
+
+**Solution**: `resolve_promoted_exports_kinds` (in `hmr_stage.rs`) reproduces that pass's `exports_kind` promotion over the scanned graph, and the result feeds both the module's own registration and, through `HmrAstFinalizer::effective_exports_kind`, the `__toESM` interop its importers need. It is a walk in the same order as the original, because the tie-break is first-importer-wins: an `import` settles a plain module as ESM while leaving a lazy-export one alone, `require` (and `import()` when code splitting is off) settles either as CommonJS. Only `exports_kind` is reproduced; `WrapKind` is chunk assembly, with no counterpart here. The map is computed once per render batch rather than per module.
+
+The lowering itself is pure AST work, so it moved to `crates/rolldown/src/utils/lazy_export.rs` and both paths call it — the link stage before scope hoisting, `render_module_code` before finalizing its clone — leaving the finalizer to handle ordinary `export default` / `export {}`. It runs before `make_semantic` so the new bindings get scoped, which is safe precisely because a module made of a single literal has no import records, and the finalizer's NodeId-keyed lookups are all keyed on those.
+
+Pinned by three fixtures under `crates/rolldown/tests/rolldown/topics/hmr/`: `no_module_syntax_dep` (imported and required files with no module syntax), `lazy_export_require` (JSON required-only, imported-only, and both at once), and the JSON row of `reexport_surface`.
+
+**Still open**: `determine_module_exports_kind` also sets `WrapKind` and runs before the rest of linking; anything downstream of _those_ effects is still invisible here. `try_rewrite_require` carries a note on the same boundary.
 
 ## Implementation Notes
 

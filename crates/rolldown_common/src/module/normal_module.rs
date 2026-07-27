@@ -166,7 +166,14 @@ impl NormalModule {
   // - `package.json` has `"type": "module"`
   // , we need to consider to stimulate the Node.js ESM behavior for maximum compatibility.
   pub fn interop(&self, importee: &NormalModule) -> Option<Interop> {
-    if matches!(importee.ecma_view.exports_kind, ExportsKind::CommonJs) {
+    self.interop_with(importee.ecma_view.exports_kind)
+  }
+
+  /// `interop`, for callers holding an importee's exports kind rather than the importee -
+  /// notably the dev module-wrapper path, where a lazy-export module's kind is resolved
+  /// per render instead of being stored on the module.
+  pub fn interop_with(&self, importee_exports_kind: ExportsKind) -> Option<Interop> {
+    if matches!(importee_exports_kind, ExportsKind::CommonJs) {
       if self.ecma_view.def_format.is_esm() { Some(Interop::Node) } else { Some(Interop::Babel) }
     } else {
       None

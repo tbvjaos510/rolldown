@@ -15,7 +15,8 @@ use oxc::{
 
 use oxc::ast::builder::{AstBuilder, GetAstBuilder};
 use rolldown_common::{
-  ExternalModule, ImportRecordIdx, ImportRecordMeta, IndexModules, Module, ModuleIdx, NormalModule,
+  ExportsKind, ExternalModule, ImportRecordIdx, ImportRecordMeta, IndexModules, Module, ModuleIdx,
+  NormalModule,
 };
 use rolldown_ecmascript::CJS_REQUIRE_REF_STR;
 use rolldown_ecmascript_utils::{
@@ -35,6 +36,13 @@ pub struct HmrAstFinalizer<'me, 'ast> {
   pub ast_builder: AstBuilder<'ast>,
   pub modules: &'me IndexModules,
   pub module: &'me NormalModule,
+  /// Not always `module.exports_kind`: a lazy-export module (JSON and friends) is scanned
+  /// as `None` and lowered into real export syntax before it gets here.
+  pub exports_kind: ExportsKind,
+  /// What the link stage would promote scanned `ExportsKind::None` modules to. That field
+  /// says "no importer has spoken yet", not "no exports", so anything branching on an
+  /// importee's kind consults this first - see `effective_exports_kind`.
+  pub promoted_exports_kinds: &'me FxHashMap<ModuleIdx, ExportsKind>,
   pub use_pife_for_module_wrappers: bool,
 
   // Each module has a unique index, which is used to generate something that needs to be unique.
@@ -326,12 +334,13 @@ impl<'ast> HmrAstFinalizer<'_, 'ast> {
     })
   }
 
+  /// The importee's exports kind as this render will actually emit it.
+  fn effective_exports_kind(&self, importee: &NormalModule) -> ExportsKind {
+    self.promoted_exports_kinds.get(&importee.idx).copied().unwrap_or(importee.exports_kind)
+  }
+
   pub fn module_exports_name(&self) -> &'static str {
-    if self.module.exports_kind.is_commonjs() {
-      "module.exports"
-    } else {
-      MODULE_EXPORTS_NAME_FOR_ESM
-    }
+    if self.exports_kind.is_commonjs() { "module.exports" } else { MODULE_EXPORTS_NAME_FOR_ESM }
   }
 
   pub fn generate_runtime_module_register_for_hmr(
@@ -339,7 +348,7 @@ impl<'ast> HmrAstFinalizer<'_, 'ast> {
     scoping: &Scoping,
   ) -> Vec<ast::Statement<'ast>> {
     let mut ret = vec![];
-    if self.module.exports_kind == rolldown_common::ExportsKind::Esm {
+    if self.exports_kind == ExportsKind::Esm {
       let binding_name_for_namespace_object_ref = self.module_exports_name();
 
       ret.extend(self.generate_declaration_of_module_namespace_object(
@@ -435,7 +444,7 @@ impl<'ast> HmrAstFinalizer<'_, 'ast> {
 
     // Use stable module ID for consistent runtime lookup
     let id = importee.stable_id.as_ref();
-    let interop = self.module.interop(importee);
+    let interop = self.module.interop_with(self.effective_exports_kind(importee));
     let call_expr = Expression::new_call_with_arg(
       Expression::new_member_access_expr("__rolldown_runtime__", "loadExports", self),
       ast::Expression::new_string_literal(SPAN, Str::from_str_in(id, self), None, self),
@@ -708,7 +717,7 @@ impl<'ast> HmrAstFinalizer<'_, 'ast> {
     }
 
     // FIXME: consider about CommonJS interop
-    let is_importee_cjs = importee.exports_kind == rolldown_common::ExportsKind::CommonJs;
+    let is_importee_cjs = self.effective_exports_kind(importee).is_commonjs();
 
     // __rolldown_runtime__.loadExports('./foo.js')
     // Use stable module ID for consistent runtime lookup
@@ -813,7 +822,7 @@ impl<'ast> HmrAstFinalizer<'_, 'ast> {
       return;
     };
 
-    let is_importee_cjs = importee.exports_kind == rolldown_common::ExportsKind::CommonJs;
+    let is_importee_cjs = self.effective_exports_kind(importee).is_commonjs();
 
     // Use stable module ID for consistent runtime lookup
     let load_exports_call = Expression::new_call_with_arg(

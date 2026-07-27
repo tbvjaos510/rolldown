@@ -1,0 +1,217 @@
+---
+source: crates/rolldown_testing/src/integration_test.rs
+---
+# Assets
+
+## main.js
+
+```js
+import assert from "node:assert";
+// HIDDEN [\0rolldown/runtime.js]
+__rolldown_runtime__.registerGraph({
+	ids: [
+		"required.json",
+		"both.json",
+		"req.cjs",
+		"imported.json",
+		"hmr.js",
+		"main.js"
+	],
+	localCount: 6,
+	edges: [
+		[],
+		[],
+		[0, 1],
+		[],
+		[
+			2,
+			3,
+			1
+		],
+		[4]
+	],
+	dynamicEdges: [
+		[],
+		[],
+		[],
+		[],
+		[],
+		[]
+	]
+});
+//#region required.json
+var require_required = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	__rolldown_runtime__.createModuleHotContext("required.json");
+	__rolldown_runtime__.registerModule("required.json", module);
+	module.exports = {
+		"name": "required",
+		"nested": { "deep": true }
+	};
+}));
+//#endregion
+//#region both.json
+var require_both = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	__rolldown_runtime__.createModuleHotContext("both.json");
+	__rolldown_runtime__.registerModule("both.json", module);
+	module.exports = {
+		"name": "both",
+		"nested": { "deep": true }
+	};
+}));
+//#endregion
+//#region req.cjs
+//#endregion
+//#region imported.json
+var import_req = /* @__PURE__ */ __toESM((/* @__PURE__ */ __commonJSMin(((exports, module) => {
+	__rolldown_runtime__.createModuleHotContext("req.cjs");
+	__rolldown_runtime__.registerModule("req.cjs", module);
+	const required = require_required();
+	const both = require_both();
+	module.exports = {
+		requiredKeys: Object.keys(required).sort().join(","),
+		bothKeys: Object.keys(both).sort().join(",")
+	};
+})))());
+var imported_exports = /* @__PURE__ */ __exportAll({
+	default: () => imported_default,
+	name: () => name,
+	nested: () => nested
+});
+__rolldown_runtime__.createModuleHotContext("imported.json");
+__rolldown_runtime__.registerModule("imported.json", { exports: imported_exports });
+var name = "imported";
+var nested = { "deep": true };
+var imported_default = {
+	name,
+	nested
+};
+//#endregion
+//#region hmr.js
+var hmr_exports = /* @__PURE__ */ __exportAll({});
+var import_both = /* @__PURE__ */ __toESM(require_both());
+const hmr_hot = __rolldown_runtime__.createModuleHotContext("hmr.js");
+__rolldown_runtime__.registerModule("hmr.js", { exports: hmr_exports });
+const keys = (value) => Object.keys(value).sort().join(",");
+assert.strictEqual(import_req.default.requiredKeys, "name,nested", "require-only JSON");
+assert.strictEqual(keys(imported_exports), "default,name,nested", "import-only JSON namespace");
+assert.strictEqual(keys(imported_default), "name,nested", "import-only JSON default");
+assert.strictEqual(import_req.default.bothKeys, "name,nested", "required side of a both-ways JSON");
+assert.strictEqual(keys(import_both.default), "name,nested", "imported side of a both-ways JSON");
+hmr_hot.accept();
+//#endregion
+//#region main.js
+var main_exports = /* @__PURE__ */ __exportAll({});
+__rolldown_runtime__.createModuleHotContext("main.js");
+__rolldown_runtime__.registerModule("main.js", { exports: main_exports });
+//#endregion
+
+```
+
+# HMR Step 0
+
+## Code
+
+```js
+__rolldown_runtime__.registerGraph({ids:["both.json","hmr.js","imported.json","req.cjs","required.json"],localCount:5,edges:[[],[3,2,0],[],[4,0],[]],dynamicEdges:[[],[],[],[],[]]});
+//#region both.json
+__rolldown_runtime__.registerFactory("both.json", "cjs", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_module__ = { exports: {} };
+		var __rolldown_exports__ = __rolldown_module__.exports;
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, __rolldown_module__);
+		const hot_both = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		__rolldown_module__.exports = {
+			"name": "both-updated",
+			"nested": { "deep": true }
+		};
+	} finally {}
+}));
+
+//#endregion
+//#region hmr.js
+import * as import_node_assert_10 from "node:assert";
+__rolldown_runtime__.registerFactory("hmr.js", "esm", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_exports__ = __rolldown_runtime__.__exportAll({});
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, { exports: __rolldown_exports__ });
+		__rolldown_runtime__.initModule("req.cjs");
+		__rolldown_runtime__.initModule("imported.json");
+		__rolldown_runtime__.initModule("both.json");
+		const hot_hmr = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		var import_req_11 = __rolldown_runtime__.__toESM(__rolldown_runtime__.loadExports("req.cjs"));
+		var import_imported_12 = __rolldown_runtime__.loadExports("imported.json");
+		var import_both_14 = __rolldown_runtime__.__toESM(__rolldown_runtime__.loadExports("both.json"));
+		const keys = (value) => Object.keys(value).sort().join(",");
+		import_node_assert_10.default.strictEqual(import_req_11.default.requiredKeys, "name,nested", "require-only JSON");
+		import_node_assert_10.default.strictEqual(keys(import_imported_12), "default,name,nested", "import-only JSON namespace");
+		import_node_assert_10.default.strictEqual(keys(import_imported_12.default), "name,nested", "import-only JSON default");
+		import_node_assert_10.default.strictEqual(import_req_11.default.bothKeys, "name,nested", "required side of a both-ways JSON");
+		import_node_assert_10.default.strictEqual(keys(import_both_14.default), "name,nested", "imported side of a both-ways JSON");
+		hot_hmr.accept();
+	} finally {}
+}));
+
+//#endregion
+//#region imported.json
+__rolldown_runtime__.registerFactory("imported.json", "esm", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_exports__ = __rolldown_runtime__.__exportAll({
+			default: () => __rolldown_default__,
+			nested: () => nested,
+			name: () => name
+		});
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, { exports: __rolldown_exports__ });
+		const hot_imported = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		var name = "imported-updated";
+		var nested = { "deep": true };
+		var __rolldown_default__ = {
+			name,
+			nested
+		};
+	} finally {}
+}));
+
+//#endregion
+//#region req.cjs
+__rolldown_runtime__.registerFactory("req.cjs", "cjs", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_module__ = { exports: {} };
+		var __rolldown_exports__ = __rolldown_module__.exports;
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, __rolldown_module__);
+		const hot_req = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		const required = (__rolldown_runtime__.initModule("required.json"), __rolldown_runtime__.loadExports("required.json"));
+		const both = (__rolldown_runtime__.initModule("both.json"), __rolldown_runtime__.loadExports("both.json"));
+		__rolldown_module__.exports = {
+			requiredKeys: Object.keys(required).sort().join(","),
+			bothKeys: Object.keys(both).sort().join(",")
+		};
+	} finally {}
+}));
+
+//#endregion
+//#region required.json
+__rolldown_runtime__.registerFactory("required.json", "cjs", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_module__ = { exports: {} };
+		var __rolldown_exports__ = __rolldown_module__.exports;
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, __rolldown_module__);
+		const hot_required = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		__rolldown_module__.exports = {
+			"name": "required-updated",
+			"nested": { "deep": true }
+		};
+	} finally {}
+}));
+
+//#endregion
+```
+
+## Meta
+
+- update type: patch
+
+### Changed Ids
+
+- required.json
+- imported.json
+- both.json

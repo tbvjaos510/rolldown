@@ -1,0 +1,150 @@
+---
+source: crates/rolldown_testing/src/integration_test.rs
+---
+# Assets
+
+## main.js
+
+```js
+import assert from "node:assert";
+// HIDDEN [\0rolldown/runtime.js]
+__rolldown_runtime__.registerGraph({
+	ids: [
+		"side-effect.js",
+		"required.js",
+		"req.cjs",
+		"hmr.js",
+		"main.js"
+	],
+	localCount: 5,
+	edges: [
+		[],
+		[],
+		[1],
+		[0, 2],
+		[3]
+	],
+	dynamicEdges: [
+		[],
+		[],
+		[],
+		[],
+		[]
+	]
+});
+//#region side-effect.js
+var side_effect_exports = /* @__PURE__ */ __exportAll({});
+__rolldown_runtime__.createModuleHotContext("side-effect.js");
+__rolldown_runtime__.registerModule("side-effect.js", { exports: side_effect_exports });
+globalThis.__sideEffect = "v0";
+//#endregion
+//#region required.js
+var require_required = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	__rolldown_runtime__.createModuleHotContext("required.js");
+	__rolldown_runtime__.registerModule("required.js", module);
+	globalThis.__required = "v0";
+}));
+//#endregion
+//#region req.cjs
+var require_req = /* @__PURE__ */ __commonJSMin(((exports, module) => {
+	__rolldown_runtime__.createModuleHotContext("req.cjs");
+	__rolldown_runtime__.registerModule("req.cjs", module);
+	const required = require_required();
+	module.exports = { keys: required === void 0 ? "UNDEFINED" : Object.keys(required).sort().join(",") };
+}));
+//#endregion
+//#region hmr.js
+var hmr_exports = /* @__PURE__ */ __exportAll({});
+var import_req = /* @__PURE__ */ __toESM(require_req());
+const hmr_hot = __rolldown_runtime__.createModuleHotContext("hmr.js");
+__rolldown_runtime__.registerModule("hmr.js", { exports: hmr_exports });
+const keys = (value) => value === void 0 ? "UNDEFINED" : Object.keys(value).sort().join(",");
+assert.strictEqual(keys(side_effect_exports), "", "namespace of an imported no-syntax module");
+assert.strictEqual(keys(import_req.default), "keys", "the CommonJS bridge itself");
+assert.strictEqual(import_req.default.keys, "", "exports of a required no-syntax module");
+assert.match(globalThis.__sideEffect, /^v[01]$/);
+assert.match(globalThis.__required, /^v[01]$/);
+hmr_hot.accept();
+//#endregion
+//#region main.js
+var main_exports = /* @__PURE__ */ __exportAll({});
+__rolldown_runtime__.createModuleHotContext("main.js");
+__rolldown_runtime__.registerModule("main.js", { exports: main_exports });
+//#endregion
+
+```
+
+# HMR Step 0
+
+## Code
+
+```js
+__rolldown_runtime__.registerGraph({ids:["hmr.js","req.cjs","required.js","side-effect.js"],localCount:4,edges:[[3,1],[2],[],[]],dynamicEdges:[[],[],[],[]]});
+//#region hmr.js
+import * as import_node_assert_00 from "node:assert";
+__rolldown_runtime__.registerFactory("hmr.js", "esm", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_exports__ = __rolldown_runtime__.__exportAll({});
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, { exports: __rolldown_exports__ });
+		__rolldown_runtime__.initModule("side-effect.js");
+		__rolldown_runtime__.initModule("req.cjs");
+		const hot_hmr = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		var import_side_effect_01 = __rolldown_runtime__.loadExports("side-effect.js");
+		var import_req_02 = __rolldown_runtime__.__toESM(__rolldown_runtime__.loadExports("req.cjs"));
+		const keys = (value) => value === undefined ? "UNDEFINED" : Object.keys(value).sort().join(",");
+		import_node_assert_00.default.strictEqual(keys(import_side_effect_01), "", "namespace of an imported no-syntax module");
+		import_node_assert_00.default.strictEqual(keys(import_req_02.default), "keys", "the CommonJS bridge itself");
+		import_node_assert_00.default.strictEqual(import_req_02.default.keys, "", "exports of a required no-syntax module");
+		import_node_assert_00.default.match(globalThis.__sideEffect, /^v[01]$/);
+		import_node_assert_00.default.match(globalThis.__required, /^v[01]$/);
+		hot_hmr.accept();
+	} finally {}
+}));
+
+//#endregion
+//#region req.cjs
+__rolldown_runtime__.registerFactory("req.cjs", "cjs", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_module__ = { exports: {} };
+		var __rolldown_exports__ = __rolldown_module__.exports;
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, __rolldown_module__);
+		const hot_req = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		const required = (__rolldown_runtime__.initModule("required.js"), __rolldown_runtime__.loadExports("required.js"));
+		__rolldown_module__.exports = { keys: required === undefined ? "UNDEFINED" : Object.keys(required).sort().join(",") };
+	} finally {}
+}));
+
+//#endregion
+//#region required.js
+__rolldown_runtime__.registerFactory("required.js", "cjs", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_module__ = { exports: {} };
+		var __rolldown_exports__ = __rolldown_module__.exports;
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, __rolldown_module__);
+		const hot_required = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		globalThis.__required = "v1";
+	} finally {}
+}));
+
+//#endregion
+//#region side-effect.js
+__rolldown_runtime__.registerFactory("side-effect.js", "esm", (function(__rolldown_module_id__) {
+	try {
+		var __rolldown_exports__ = __rolldown_runtime__.__exportAll({});
+		__rolldown_runtime__.registerModule(__rolldown_module_id__, { exports: __rolldown_exports__ });
+		const hot_side_effect = __rolldown_runtime__.createModuleHotContext(__rolldown_module_id__);
+		globalThis.__sideEffect = "v1";
+	} finally {}
+}));
+
+//#endregion
+```
+
+## Meta
+
+- update type: patch
+
+### Changed Ids
+
+- required.js
+- side-effect.js

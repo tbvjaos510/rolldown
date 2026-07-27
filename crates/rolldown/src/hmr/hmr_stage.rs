@@ -10,8 +10,8 @@ use arcstr::ArcStr;
 use oxc::ast::builder::AstBuilder;
 use oxc_traverse::traverse_mut;
 use rolldown_common::{
-  ClientHmrInput, ClientHmrUpdate, HmrLazyChunkOutput, HmrPatch, HmrStampTable, HmrUpdate,
-  ImportKind, Module, ModuleIdx, ModuleTable, ScanMode, WatcherChangeKind,
+  ClientHmrInput, ClientHmrUpdate, ExportsKind, HmrLazyChunkOutput, HmrPatch, HmrStampTable,
+  HmrUpdate, ImportKind, Module, ModuleIdx, ModuleTable, ModuleType, ScanMode, WatcherChangeKind,
 };
 use rolldown_ecmascript::{EcmaAst, EcmaCompiler, PrintCommentsOptions, PrintOptions};
 use rolldown_error::BuildResult;
@@ -35,6 +35,7 @@ use crate::{
   type_alias::IndexEcmaAst,
   types::scan_stage_cache::ScanStageCache,
   utils::{
+    lazy_export::{LoweredLazyExport, lower_lazy_export},
     process_code_and_sourcemap::process_code_and_sourcemap,
     render_ecma_module::collapse_module_sourcemap,
   },
@@ -82,6 +83,7 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
     Self { input }
   }
 
+  #[expect(clippy::too_many_lines)]
   pub async fn compute_hmr_update_for_file_changes(
     &mut self,
     changed_file_paths: &FxIndexMap<String, WatcherChangeKind>,
@@ -177,11 +179,12 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
           })
         })
         .collect::<Vec<_>>();
+      let promoted_exports_kinds = self.resolve_promoted_exports_kinds();
       pre_rebuild_inputs
         .into_par_iter()
         .map(|render_input| {
           let module_idx = render_input.idx;
-          (module_idx, self.render_module_code(render_input, 0, false).0)
+          (module_idx, self.render_module_code(render_input, 0, false, &promoted_exports_kinds).0)
         })
         .collect::<Vec<_>>()
         .into_iter()
@@ -260,11 +263,12 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
         Some(ModuleRenderInput { idx: *module_idx, ecma_ast: ecma_ast.clone_with_another_arena() })
       })
       .collect::<Vec<_>>();
+    let promoted_exports_kinds = self.resolve_promoted_exports_kinds();
     let output_unchanged_modules = recheck_inputs
       .into_par_iter()
       .filter_map(|render_input| {
         let module_idx = render_input.idx;
-        let (code, _) = self.render_module_code(render_input, 0, false);
+        let (code, _) = self.render_module_code(render_input, 0, false, &promoted_exports_kinds);
         (pre_rebuild_renders[&module_idx] == code).then_some(module_idx)
       })
       .collect::<Vec<_>>()
@@ -553,12 +557,14 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
     ) {
       source_joiner.append_source(prelude);
     }
+    let promoted_exports_kinds = self.resolve_promoted_exports_kinds();
     let rendered_sources = module_render_inputs
       .into_par_iter()
       .enumerate()
       .flat_map(|(index, render_input)| {
         let affected_module_idx = render_input.idx;
-        let (code, map) = self.render_module_code(render_input, index, true);
+        let (code, map) =
+          self.render_module_code(render_input, index, true, &promoted_exports_kinds);
 
         let affected_module = &self.module_table().modules[affected_module_idx];
         let Module::Normal(affected_module) = affected_module else {
@@ -683,12 +689,14 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
     ) {
       source_joiner.append_source(prelude);
     }
+    let promoted_exports_kinds = self.resolve_promoted_exports_kinds();
     let rendered_sources = module_render_inputs
       .into_par_iter()
       .enumerate()
       .flat_map(|(index, render_input)| {
         let affected_module_idx = render_input.idx;
-        let (code, map) = self.render_module_code(render_input, index, true);
+        let (code, map) =
+          self.render_module_code(render_input, index, true, &promoted_exports_kinds);
 
         let affected_module = &self.module_table().modules[affected_module_idx];
         let Module::Normal(affected_module) = affected_module else {
@@ -760,18 +768,68 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
     }))
   }
 
+  /// The exports kinds the link stage would promote scanned `ExportsKind::None` modules to.
+  ///
+  /// The scanner sees one module at a time, so a file carrying no module syntax comes out
+  /// `None` - not "has no exports" but "no importer has said yet". `determine_module_exports_kind`
+  /// settles it from the importers: an `import` makes it ESM, a `require` (and `import()`
+  /// when code splitting is off) makes it CommonJS, and whichever importer reaches it first
+  /// wins. This path never runs that pass, and reading the scanned field instead is wrong
+  /// twice over - the module registers as `registerModule(id, {})`, which holds no exports
+  /// at all so `loadExports` yields `undefined` instead of a namespace, and a lazy-export
+  /// module lowers to the shape its importers did not ask for.
+  ///
+  /// So walk the scanned graph in that pass's own order; the ordering is what makes the
+  /// first-importer-wins tie-break agree. Only the `exports_kind` promotion is reproduced -
+  /// `WrapKind` is chunk assembly, which has no counterpart here.
+  fn resolve_promoted_exports_kinds(&self) -> FxHashMap<ModuleIdx, ExportsKind> {
+    let modules = &self.module_table().modules;
+    let promoted_by_dynamic_import = self.options.code_splitting.is_disabled();
+    let mut promoted: FxHashMap<ModuleIdx, ExportsKind> = FxHashMap::default();
+
+    for importer in modules.iter().filter_map(Module::as_normal) {
+      for rec in &importer.import_records {
+        let Some(importee_idx) = rec.resolved_module else { continue };
+        let Some(importee) = modules[importee_idx].as_normal() else { continue };
+        // Settled at scan time, or already settled by an earlier importer.
+        if !matches!(importee.exports_kind, ExportsKind::None)
+          || promoted.contains_key(&importee_idx)
+        {
+          continue;
+        }
+        match rec.kind {
+          // A lazy-export module already stands for a value, so importing it settles
+          // nothing; only `require` reshapes it, and a later one still can.
+          ImportKind::Import if !importee.meta.has_lazy_export() => {
+            promoted.insert(importee_idx, ExportsKind::Esm);
+          }
+          ImportKind::Require => {
+            promoted.insert(importee_idx, ExportsKind::CommonJs);
+          }
+          ImportKind::DynamicImport if promoted_by_dynamic_import => {
+            promoted.insert(importee_idx, ExportsKind::CommonJs);
+          }
+          _ => {}
+        }
+      }
+    }
+    promoted
+  }
+
   /// Finalize and print one module into its HMR payload form (factory-registration
   /// snippet, without the `//#region` framing).
   ///
   /// `unique_index` seeds the payload-position-dependent binding suffixes, so two
   /// renders of the same module compare equal only when they pin it to the same
   /// value. `with_sourcemap: false` skips sourcemap generation even when the
-  /// options ask for one.
+  /// options ask for one. `promoted_exports_kinds` comes from
+  /// `resolve_promoted_exports_kinds` and is shared across a whole render batch.
   fn render_module_code(
     &self,
     render_input: ModuleRenderInput,
     unique_index: usize,
     with_sourcemap: bool,
+    promoted_exports_kinds: &FxHashMap<ModuleIdx, ExportsKind>,
   ) -> (String, Option<SourceMap>) {
     let ModuleRenderInput { idx: module_idx, ecma_ast: mut ast } = render_input;
 
@@ -785,6 +843,30 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
       self.options.optimization.is_pife_for_module_wrappers_enabled();
     let modules = &self.module_table().modules;
 
+    let resolved_exports_kind =
+      promoted_exports_kinds.get(&module_idx).copied().unwrap_or(module.exports_kind);
+
+    // JSON, text, base64 and dataurl modules are scanned as one bare expression statement
+    // whose value nothing reads - the export syntax they stand for is synthesized later, by
+    // the link stage, which this path never runs. Lower them here with the same shared
+    // rewrite so the wrapper exposes what the eagerly bundled module exposes.
+    //
+    // This runs before `make_semantic` on purpose: the new bindings need scoping, and the
+    // NodeId-keyed lookups the finalizer does are all keyed on import records, which a
+    // module made of a single literal cannot have.
+    let exports_kind = if module.meta.has_lazy_export() {
+      match lower_lazy_export(
+        &mut ast,
+        matches!(module.module_type, ModuleType::Json),
+        resolved_exports_kind.is_commonjs(),
+      ) {
+        LoweredLazyExport::CommonJs => ExportsKind::CommonJs,
+        LoweredLazyExport::EsmDefault | LoweredLazyExport::EsmJsonObject(_) => ExportsKind::Esm,
+      }
+    } else {
+      resolved_exports_kind
+    };
+
     ast.program.with_mut(|fields| {
       // Re-running semantic re-stamps every NodeId. The NodeId-keyed side-table lookups
       // below still hit only because the clone is unmutated at this point: identical tree
@@ -793,9 +875,11 @@ impl<'a, Fs: FileSystem + Clone + 'static> HmrStage<'a, Fs> {
 
       let mut finalizer = HmrAstFinalizer {
         modules,
+        promoted_exports_kinds,
         ast_builder: AstBuilder::new(fields.allocator),
         import_bindings: FxHashMap::default(),
         module,
+        exports_kind,
         exports: oxc::allocator::Vec::new_in(&fields.allocator),
         use_pife_for_module_wrappers,
         dependencies: FxIndexSet::default(),

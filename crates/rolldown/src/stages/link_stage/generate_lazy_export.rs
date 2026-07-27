@@ -1,28 +1,18 @@
-use indexmap::map::Entry;
-use oxc::allocator::GetAllocator;
-use oxc::ast::builder::AstBuilder;
 use oxc::{
-  allocator::{ReplaceWith, TakeIn},
-  ast::ast::{self, Expression, Statement},
   semantic::{SemanticBuilder, Stats},
   span::SPAN,
 };
-use oxc_str::CompactStr;
 use rolldown_common::{
-  EcmaModuleAstUsage, ExportsKind, GetLocalDbMut, LocalExport, Module, ModuleIdx, ModuleType,
-  NormalModule, StmtInfo, StmtInfoIdx, StmtInfos, SymbolOrMemberExprRef, SymbolRef,
-  SymbolRefDbForModule, TaggedSymbolRef, WrapKind,
+  EcmaModuleAstUsage, ExportsKind, GetLocalDbMut, LocalExport, ModuleIdx, ModuleType, NormalModule,
+  StmtInfo, StmtInfoIdx, StmtInfos, SymbolOrMemberExprRef, SymbolRef, SymbolRefDbForModule,
+  TaggedSymbolRef, WrapKind,
 };
-use rolldown_ecmascript::EcmaAst;
-use rolldown_ecmascript_utils::{ExpressionFactoryExt as _, StatementFactoryExt as _};
-use rolldown_utils::ecmascript::legitimize_json_local_binding_name;
 #[cfg(not(target_family = "wasm"))]
 use rolldown_utils::rayon::IndexedParallelIterator;
-use rolldown_utils::{
-  indexmap::FxIndexMap,
-  rayon::{IntoParallelRefMutIterator, ParallelIterator},
-};
+use rolldown_utils::rayon::{IntoParallelRefMutIterator, ParallelIterator};
 use smallvec::smallvec;
+
+use crate::utils::lazy_export::{JsonBindings, LoweredLazyExport, lower_lazy_export};
 
 use super::LinkStage;
 
@@ -68,26 +58,25 @@ impl LinkStage<'_> {
 
     for LazyModuleInfo { idx: module_idx, exports_kind, is_json } in lazy_modules {
       let Some(ecma_ast) = &mut self.ast_table[module_idx] else { unreachable!() };
-      if matches!(exports_kind, ExportsKind::CommonJs) {
-        replace_first_expr_stmt(ecma_ast, LazyExportWrap::CjsExport);
-        continue;
-      }
-      // ExportsKind == Esm && ModuleType == Json
-      if is_json {
-        if json_object_expr_to_esm(self, module_idx) {
+      // The AST rewrite is shared with the dev module-wrapper path, which has no link stage
+      // to lower these modules for it; only the bookkeeping below is this stage's own.
+      match lower_lazy_export(ecma_ast, is_json, matches!(exports_kind, ExportsKind::CommonJs)) {
+        LoweredLazyExport::CommonJs => continue,
+        LoweredLazyExport::EsmJsonObject(bindings) => {
+          record_json_object_exports(self, module_idx, &bindings);
           continue;
         }
-        // if json is not a ObjectExpression, we will fallback to normal esm lazy export transform
-        let stmt_infos = &mut self.stmt_infos[module_idx];
-        let module = &mut self.module_table[module_idx];
-        let module = module.as_normal_mut().unwrap();
-        let default_export_ref = module.default_export_ref;
-        update_module_default_export_info(module, stmt_infos, default_export_ref);
+        LoweredLazyExport::EsmDefault => {
+          // A JSON payload that turned out not to be an object literal deferred this until
+          // now; every other lazy-export module already recorded it above.
+          if is_json {
+            let stmt_infos = &mut self.stmt_infos[module_idx];
+            let module = self.module_table[module_idx].as_normal_mut().unwrap();
+            let default_export_ref = module.default_export_ref;
+            update_module_default_export_info(module, stmt_infos, default_export_ref);
+          }
+        }
       }
-
-      // shadowing the previous mutable ref, to avoid reference mutable ref twice at the same time.
-      let Some(ecma_ast) = &mut self.ast_table[module_idx] else { unreachable!() };
-      replace_first_expr_stmt(ecma_ast, LazyExportWrap::EsmDefault);
 
       // Ensure exports_kind is set to Esm for all modules that generate ESM export syntax.
       // This is needed for proper CJS export rendering in preserveModules mode.
@@ -96,37 +85,6 @@ impl LinkStage<'_> {
       module.exports_kind = ExportsKind::Esm;
     }
   }
-}
-
-#[derive(Clone, Copy)]
-enum LazyExportWrap {
-  CjsExport,
-  EsmDefault,
-}
-
-/// Takes the expression of the first statement (which must be an `ExpressionStatement`)
-/// and replaces the statement with either `module.exports = expr` or `export default expr`.
-fn replace_first_expr_stmt(ecma_ast: &mut EcmaAst, kind: LazyExportWrap) {
-  ecma_ast.program.with_mut(|fields| {
-    let ast_builder = AstBuilder::new(fields.allocator);
-    let Some(stmt) = fields.program.body.first_mut() else { unreachable!() };
-    stmt.replace_with(|old| {
-      let ast::Statement::ExpressionStatement(expr_stmt) = old else { unreachable!() };
-      let expr = expr_stmt.unbox().expression;
-      match kind {
-        LazyExportWrap::CjsExport => Statement::new_module_exports_stmt(expr, &ast_builder),
-        LazyExportWrap::EsmDefault => Statement::new_export_default_stmt(expr, &ast_builder),
-      }
-    });
-  });
-}
-
-/// Returns the owned expression with any wrapping `(...)` parentheses removed.
-fn into_without_parentheses(mut expr: Expression<'_>) -> Expression<'_> {
-  while let Expression::ParenthesizedExpression(paren_expr) = expr {
-    expr = paren_expr.unbox().expression;
-  }
-  expr
 }
 
 fn update_module_default_export_info(
@@ -142,122 +100,33 @@ fn update_module_default_export_info(
     .declare_symbol_for_stmt(FIRST_TOP_LEVEL_STMT_IDX, TaggedSymbolRef::normal(default_symbol_ref));
 }
 
-/// return true if the json is a ObjectExpression
-fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -> bool {
-  let module = &mut link_staged.module_table[module_idx];
-  let Module::Normal(module) = module else {
-    return false;
-  };
-
-  let ecma_ast = link_staged.ast_table[module_idx].as_mut().unwrap();
-  // (local, (exported, legal_ident))
-  let mut declaration_binding_names: FxIndexMap<CompactStr, (CompactStr, bool)> =
-    FxIndexMap::default();
-  let transformed = ecma_ast.program.with_mut(|fields| {
-    let mut index_map = FxIndexMap::default();
-    let ast_builder = AstBuilder::new(fields.allocator);
-    let program = fields.program;
-    let Some(ast::Statement::ExpressionStatement(stmt)) = program.body.first() else {
-      unreachable!()
-    };
-    if !matches!(stmt.expression.without_parentheses(), Expression::ObjectExpression(_)) {
-      return false;
-    }
-    // Take the single-statement body by value; this leaves `program.body` empty.
-    let Some(ast::Statement::ExpressionStatement(stmt)) =
-      program.body.take_in(&ast_builder.allocator()).into_iter().next()
-    else {
-      unreachable!();
-    };
-    let Expression::ObjectExpression(mut obj_expr) =
-      into_without_parentheses(stmt.unbox().expression)
-    else {
-      unreachable!();
-    };
-
-    // convert {"a": "b", "c": "d"} to
-    // {"a": b, "c": d}
-    // and collect related info
-    for property in &mut obj_expr.properties {
-      match property {
-        ast::ObjectPropertyKind::ObjectProperty(property) => {
-          let key = property.key.static_name().expect("should be static name");
-          if key.is_empty() {
-            continue;
-          }
-          let legitimized_ident =
-            legitimize_json_local_binding_name(&key, &declaration_binding_names);
-
-          let is_legal_ident = legitimized_ident.as_str() == key;
-
-          declaration_binding_names
-            .insert(legitimized_ident.clone(), (CompactStr::new(&key), is_legal_ident));
-
-          let value = std::mem::replace(
-            &mut property.value,
-            Expression::new_id_ref_expr(SPAN, legitimized_ident.as_str(), &ast_builder),
-          );
-          // TODO(shulaoda): Waiting for oxc transform to support the ES feature `ShorthandProperties`.
-          if key == "__proto__" {
-            property.computed = true;
-          } else if is_legal_ident {
-            property.shorthand = is_legal_ident;
-            property.key = ast::PropertyKey::new_static_identifier(
-              SPAN,
-              oxc::ast::ast::Str::from_str_in(legitimized_ident.as_ref(), &ast_builder),
-              &ast_builder,
-            );
-          }
-          match index_map.entry(legitimized_ident) {
-            Entry::Occupied(mut occ) => {
-              *occ.get_mut() = value;
-            }
-            Entry::Vacant(vac) => {
-              vac.insert(value);
-            }
-          }
-        }
-        ast::ObjectPropertyKind::SpreadProperty(_) => unreachable!(),
-      }
-    }
-    // recreate Json Module
-    let stmts = index_map
-      .into_iter()
-      // declaration
-      .map(|(local, v)| Statement::new_var_decl(local.as_str(), v, &ast_builder))
-      // export default json module
-      .chain(std::iter::once(Statement::new_export_default_stmt(
-        Expression::ObjectExpression(obj_expr),
-        &ast_builder,
-      )))
-      // export all declaration
-      .chain(std::iter::once(Statement::new_export_named_stmt(
-        None,
-        declaration_binding_names.iter(),
-        &ast_builder,
-      )));
-    program.body.extend(stmts);
-    true
-  });
-
-  if !transformed {
-    return false;
-  }
+/// Bookkeeping for a JSON module that `lower_lazy_export` split into one binding per key:
+/// semantic data for the rewritten AST, a named export per binding, and the statement infos
+/// that let tree shaking drop the keys nobody imported.
+fn record_json_object_exports(
+  link_staged: &mut LinkStage,
+  module_idx: ModuleIdx,
+  declaration_binding_names: &JsonBindings,
+) {
   let original_symbol_ref_db = std::mem::take(link_staged.symbols.local_db_mut(module_idx));
   // recreate semantic data
   #[expect(clippy::cast_possible_truncation)]
-  let scoping = ecma_ast.make_symbol_table_and_scope_tree_with_semantic_builder(
-    SemanticBuilder::new().with_stats(Stats {
-      nodes: declaration_binding_names.len().next_power_of_two() as u32,
-      scopes: 1,
-      symbols: declaration_binding_names.len() as u32,
-      references: declaration_binding_names.len() as u32 * 2u32,
-    }),
-  );
+  let scoping = {
+    let ecma_ast = link_staged.ast_table[module_idx].as_mut().unwrap();
+    ecma_ast.make_symbol_table_and_scope_tree_with_semantic_builder(
+      SemanticBuilder::new().with_stats(Stats {
+        nodes: declaration_binding_names.len().next_power_of_two() as u32,
+        scopes: 1,
+        symbols: declaration_binding_names.len() as u32,
+        references: declaration_binding_names.len() as u32 * 2u32,
+      }),
+    )
+  };
 
   // update semantic data of module
   let root_scope_id = scoping.root_scope_id();
   let mut symbol_ref_db = SymbolRefDbForModule::new(scoping, module_idx, root_scope_id);
+  let module = link_staged.module_table[module_idx].as_normal_mut().unwrap();
   // Re-create facade symbols in the new scoping. The JSON module was re-parsed above,
   // producing a new Scoping with fresh symbol IDs, so old facade IDs are invalid.
   // We allocate new IDs by name and update the module's references.
@@ -279,7 +148,7 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
   let stmt_info = stmt_infos.drain(FIRST_TOP_LEVEL_STMT_IDX..);
   let mut all_declared_symbols =
     stmt_info.flat_map(|info| info.referenced_symbols).collect::<Vec<_>>();
-  for (local, (exported, _)) in &declaration_binding_names {
+  for (local, (exported, _)) in declaration_binding_names {
     let symbol_id =
       symbol_ref_db.scoping().get_root_binding(local.as_str().into()).expect("should have binding");
     let symbol_ref: SymbolRef = (module_idx, symbol_id).into();
@@ -316,5 +185,4 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
   link_staged.metas[module_idx].set_wrap_kind(WrapKind::None);
 
   link_staged.symbols.store_local_db(module_idx, symbol_ref_db);
-  true
 }

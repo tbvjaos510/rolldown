@@ -57,7 +57,7 @@ impl<'ast> Traverse<'ast, ()> for HmrAstFinalizer<'_, 'ast> {
     // Factories uniformly take only `__rolldown_module_id__`; for CommonJS the
     // module/exports objects become locals the body's rewritten `module`/`exports`
     // references resolve to.
-    let cjs_module_locals: Vec<ast::Statement<'ast>> = if self.module.exports_kind.is_commonjs() {
+    let cjs_module_locals: Vec<ast::Statement<'ast>> = if self.exports_kind.is_commonjs() {
       let empty_exports_object = ast::Expression::new_object_expression(SPAN, [], self);
       let module_object = ast::Expression::new_object_expression(
         SPAN,
@@ -201,7 +201,7 @@ impl<'ast> Traverse<'ast, ()> for HmrAstFinalizer<'_, 'ast> {
     register_factory_args.push(ast::Argument::new_string_literal(
       SPAN,
       oxc::ast::ast::Str::from_str_in(
-        if self.module.exports_kind.is_commonjs() { "cjs" } else { "esm" },
+        if self.exports_kind.is_commonjs() { "cjs" } else { "esm" },
         self,
       ),
       None,
@@ -238,7 +238,7 @@ impl<'ast> Traverse<'ast, ()> for HmrAstFinalizer<'_, 'ast> {
     // Rewrite top-level `this` to `exports` for CommonJS modules
     // Use `this_expr_replace_map` from scanning to avoid rewriting `this` inside classes
     if let ast::Expression::ThisExpression(this_expr) = node
-      && self.module.exports_kind.is_commonjs()
+      && self.exports_kind.is_commonjs()
       && self.module.ecma_view.this_expr_replace_map.contains_key(&this_expr.node_id())
     {
       *node = Expression::new_id_ref_expr(SPAN, CJS_ROLLDOWN_EXPORTS_REF, self);

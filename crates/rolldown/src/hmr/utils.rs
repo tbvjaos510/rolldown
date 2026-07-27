@@ -20,6 +20,13 @@ pub trait HmrAstBuilder<'any, 'ast> {
 
   fn module(&self) -> &NormalModule;
 
+  /// The module's exports kind as of *this* emission. It is not always the scanned one:
+  /// a lazy-export module (JSON and friends) is lowered into real export syntax on its
+  /// way here, and then registers whatever that lowering produced.
+  fn exports_kind(&self) -> rolldown_common::ExportsKind {
+    self.module().exports_kind
+  }
+
   // `${ns_name}` in `var ${ns_name} = ...`
   fn binding_name_for_namespace_object_ref_atom(&self) -> ast::Str<'ast>;
 
@@ -45,7 +52,7 @@ pub trait HmrAstBuilder<'any, 'ast> {
 
   /// `__rolldown_runtime__.registerModule(moduleId, module)`
   fn create_register_module_stmt(&self) -> ast::Statement<'ast> {
-    let module_exports = match self.module().exports_kind {
+    let module_exports = match self.exports_kind() {
       rolldown_common::ExportsKind::Esm => {
         let binding_name_for_namespace_object_ref_atom =
           self.binding_name_for_namespace_object_ref_atom();
@@ -146,6 +153,10 @@ impl<'any, 'ast> HmrAstBuilder<'any, 'ast> for HmrAstFinalizer<'any, 'ast> {
 
   fn module(&self) -> &NormalModule {
     self.module
+  }
+
+  fn exports_kind(&self) -> rolldown_common::ExportsKind {
+    self.exports_kind
   }
 
   fn binding_name_for_namespace_object_ref_atom(&self) -> ast::Str<'ast> {
